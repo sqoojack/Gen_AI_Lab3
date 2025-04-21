@@ -1,0 +1,8 @@
+torch
+transformers
+faiss-cpu
+numpy
+tqdm
+langchain
+langchain_text_splitters
+sentence-transformers
