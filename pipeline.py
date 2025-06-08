@@ -1,3 +1,5 @@
+
+# not use langchain
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, logging, BitsAndBytesConfig
 import json
@@ -9,37 +11,38 @@ from langchain.docstore.document import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 
-# ---------------------------- 超參數 ----------------------------
+""" Set Hyperparameter """
 class HyperParameters:
-    def __init__(self, top_k, top_p, temperature, chunk_size, chunk_overlap, max_length, dist_threshold):
-        self.top_k = top_k
-        self.top_p = top_p
-        self.temperature = temperature
+    def __init__(self, chunk_size, chunk_overlap, max_length, dist_threshold, top_k, top_p, temperature):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.max_length = max_length
         self.dist_threshold = dist_threshold
+        self.top_k = top_k
+        self.top_p = top_p
+        self.temperature = temperature
 
 config = HyperParameters(
-    top_k=13,
-    top_p=0.9,
-    temperature=0.7,
     chunk_size=256,
     chunk_overlap=128,
-    max_length=256,
-    dist_threshold=0.6
+    max_length=256,     # maximum number of tokens to create
+    dist_threshold=0.6,
+    top_k=13,
+    top_p=0.9,
+    temperature=0.7
 )
 
-# ---------------------------- 輔助函式 ----------------------------
+""" Preprocessing the full_text """
 def clean_text(text):
-    text = re.sub(r'<[^>]+>', '', text)
-    text = re.sub(r'\[\d+\]', '', text)
-    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'<[^>]+>', '', text)     # remove HTML label (ex: <div>, <p>)
+    text = re.sub(r'\[\d+\]', '', text)     # remove citation of paper (ex: [1], [2])
+    text = re.sub(r'\s+', ' ', text)     # replace multiple space with one space
     return text.strip()
 
 def split_by_chapter(text):
-    pattern = re.compile(r"(Abstract|Introduction|Related Works|Proposed method|Results|Discussion|Conclusion|Acknowledgment)", re.IGNORECASE)
-    parts = re.split(pattern, text)
+    # Used to detect and split section titles in a paper. re.IGNORECASE: to ignore the uppercase or lowercase
+    pattern = re.compile(r"(Abstract|Introduction|Related Works|Proposed method|Results|Discussion|Conclusion|Acknowledgment)", re.IGNORECASE)      
+    parts = re.split(pattern, text)     # This is used with re.compile()
     chapters = []
     if len(parts) <= 1:
         chapters.append(text)
@@ -55,139 +58,148 @@ def split_by_chapter(text):
 def split_in_chapter(chapter_text, chunk_size):
     if len(chapter_text) <= chunk_size:
         return [chapter_text]
-    sentences = re.split(r'(?<=[\.!?])\s+', chapter_text)
-    chunks, current = [], ""
-    for s in sentences:
+    sentence = re.split(r'(?<=[.!?]) +', chapter_text)  # split by sentence
+    chunks, current = [], ""   # chunks: is a list used to store the split chunks, current: is a string used to store the current chunk
+    
+    # Iterate through each sentence and check if adding it to the current chunk exceeds the chunk size
+    for s in sentence:  
         if len(current) + len(s) <= chunk_size:
             current += s + " "
         else:
-            if current: chunks.append(current.strip())
+            chunks.append(current.strip())
             current = s + " "
-    if current: chunks.append(current.strip())
+    if current:
+        chunks.append(current.strip())
     return chunks
 
 def split_text(full_text, chunk_size, chunk_overlap):
     cleaned = clean_text(full_text)
     chapters = split_by_chapter(cleaned)
     all_chunks = []
-    for chap in chapters:
-        segs = split_in_chapter(chap, chunk_size)
-        if len(segs) > 1:
-            merged = [segs[0]]
-            for i in range(1, len(segs)):
-                prev = merged[-1]
-                overlap = prev[-chunk_overlap:] if len(prev) > chunk_overlap else prev
-                merged.append(overlap + " " + segs[i])
-            segs = merged
-        all_chunks.extend(segs)
+    for chapter in chapters:
+        segments = split_in_chapter(chapter, chunk_size)    # split the chapter into segments
+        
+        # address the chunk overlap
+        if len(segments) > 1:
+            merged = [segments[0]]      # initialize merged with the first segment
+            for i in range(1, len(segments)):
+                prev = merged[-1]     # get the last merged segment
+                overlap = prev[-chunk_overlap:] if len(prev) > chunk_overlap else prev      # get the last chunk with overlap
+                merged.append(overlap + " " + segments[i])      # merge the overlap with the current segment
+            segments = merged   # update segments with the merged segments
+        all_chunks.extend(segments)
     return all_chunks
 
-def build_prompt(question: str, retrieved_chunks):
-    evidence = "\n".join(retrieved_chunks)
-    return f"""
-<|begin_of_text|><|start_header_id|>user<|end_header_id|>
-Return only the final JSON answer. Do not repeat the question, the evidence, or any dialogue tags.
-You need to based on provided question and evidence. To generate the final answer. Rememeber to use the CoT(Chain of Thought) to help you solve problem.
-Question:
-{question}
+def build_prompts(question, retrieved_chunks):
+    evidence = "\n".join(retrieved_chunks)  # combine the list into a single string by new line
+    return f""" 
+        <|begin_of_text|><|start_header_id|>user<|end_header_id|>
+        Return only the final JSON answer. Do not repeat the question, the evidence, or any dialogue tags.
+        You need to based on provided question and evidence. To generate the final answer. Rememeber to use the CoT(Chain of Thought) to help you solve problem.
+        Question:
+        {question}
 
-Evidence:
-{evidence}
+        Evidence:
+        {evidence}
 
-Please output:
-<your concise answer>
+        Please output:
+        <your concise answer>
 
-<|end_of_text|>
-"""
-
-# ---------------------------- 核心產生並解析答案 ----------------------------
-def batch_generate_answer(device, prompts, model, tokenizer, max_new_tokens, gen_batch_size, top_k, top_p, temperature):
+        <|end_of_text|>
+        """
+            
+def generate_answer(device, prompts, tokenizer, model, max_new_tokens):
     results = []
-    for i in range(0, len(prompts), gen_batch_size):
-        batch = prompts[i:i+gen_batch_size]
-        inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        # 1. 記錄 prompt token 長度
-        input_len = inputs["input_ids"].shape[1]
-
-        # 2. 產生
-        outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, 
-        num_beams=5, eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.eos_token_id)
-
-        # 3. 切片並解析
-        for out in outputs:
-            gen = out[input_len:]  # 從 prompt 之後開始
-            raw = tokenizer.decode(gen, skip_special_tokens=True).strip()
-            # 把 '"answer": ["English", "Russian"]' → 加大括號成合法 JSON
-            try:
-                data = json.loads("{" + raw + "}")
-                answers = data.get("answer", [])
-            except Exception:
-                # 若無法解析，就用簡單字串擷取中括號
-                m = re.search(r"\[.*?\]", raw)
-                if m:
-                    answers = json.loads(m.group(0))
-                else:
-                    answers = [raw]
-            results.append(answers)
+    for prompt in prompts: 
+        input_ids = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=config.max_length)
+        input_ids = {k: v.to(device) for k, v in input_ids.items()}  # move input_ids to the same device as the model
+        input_lens = input_ids["input_ids"].shape[1]  # get the length of prompt_tokens
+        
+        outputs = model.generate(
+            **input_ids,    # inputs contains input_ids and attention_mask, used as input for the model
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            num_beams=1,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        
+    # address the outputs
+    for output in outputs:
+        generated_text = output[input_lens:]   # remove the prompt tokens from the output
+        raw = tokenizer.decode(generated_text, skip_special_tokens=True).strip()  # decode the output
+        
+        # try to parse(解析) the JSON output
+        try:
+            data = json.loads("{" + raw + "}")  # parse the JSON output
+            answers = data.get("answer", "")  # get the answer from the JSON output
+        except Exception:
+            m = re.search(r"\[.*?\]", raw)  # find the first JSON-like string
+            if m:
+                answers = json.loads(m.group(0))  # parse the JSON-like string
+            else:
+                answers = [raw]
+                
+        results.append(answers)
     return results
 
-# ---------------------------- 主流程 ----------------------------
+
 def main():
     device = torch.device("cuda:1")
-    logging.set_verbosity_error()
-
-    # 讀資料
-    # with open("test.json", "r", encoding="utf-8") as f:
-    # with open("public_dataset.json", "r", encoding="utf-8") as f:
-    with open("private_dataset.json", "r", encoding="utf-8") as f:    
-        samples = json.load(f)
-
-    # 載模型
+    logging.set_verbosity_error()  # Suppress warnings from transformers
+    
+    # with open('test.json', 'r', encoding='utf-8') as f:
+    with open('public_dataset.json', 'r', encoding='utf-8') as f:
+    # with open('private_dataset.json', 'r', encoding='utf-8') as f:
+        data = json.load(f)
+        
     embed_model = SentenceTransformer('intfloat/multilingual-e5-large', device=device)
     model_name = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, load_in_8bit=True, device_map="auto",
-        torch_dtype=torch.float16, trust_remote_code=True
+    # model_name = "mistralai/Mistral-7B-Instruct-v0.3"
+    
+    bnb_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_threshold=6.0,           # can be fine-tuned depending on the memory usage
+        llm_int8_has_fp16_weight=False   # set to True for higher performance
     )
+    model = AutoModelForCausalLM.from_pretrained(model_name, quantization_config=bnb_config, device_map="auto", torch_dtype=torch.float16)
+    
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
+        
     results = []
-    for sample in tqdm(samples, desc="Per-paper RAG", ncols=120):
-        chunks = split_text(sample.get("full_text", ""),
-                            config.chunk_size, config.chunk_overlap)
-        embeds = embed_model.encode(chunks, convert_to_tensor=False)
-        embeds = np.array(embeds, dtype="float32")
-        index = faiss.IndexFlatL2(embeds.shape[1])
-        index.add(embeds)
-
-        q_emb = embed_model.encode([sample["question"]], convert_to_tensor=False)
-        dist, idx = index.search(np.array(q_emb, dtype="float32"), config.top_k)
-        retrieved = [chunks[i] for d, i in zip(dist[0], idx[0]) if d <= config.dist_threshold]
-
-        prompt = build_prompt(sample["question"], retrieved)
-        answers = batch_generate_answer(
-            device, [prompt], model, tokenizer,
-            config.max_length, 1,
-            config.top_k, config.top_p, config.temperature
-        )[0]  # 取第一筆
-
+    for sample in tqdm(data, desc="Per-paper RAG addressing", ncols=120):
+        text = sample.get("full_text", "")
+        chunks = split_text(text, config.chunk_size, config.chunk_overlap)
+            
+        embeddings = embed_model.encode(chunks, convert_to_tensor=False)
+        embeddings = np.array(embeddings, dtype=np.float32)
+        index = faiss.IndexFlatL2(embeddings.shape[1])
+        index.add(embeddings)
+        
+        question_embedding = embed_model.encode([sample["question"]], convert_to_tensor=False)
+        dist, idx = index.search(np.array(question_embedding, dtype=np.float32), config.top_k)
+        retrieved_chunks = [chunks[i] for d, i in zip(dist[0], idx[0]) if d <= config.dist_threshold]   # get the top k chunks
+        
+        prompt = build_prompts(sample["question"], retrieved_chunks)
+        answers = generate_answer(device, [prompt], tokenizer, model, config.max_length)[0]
+        answers_str = answers[0] if isinstance(answers, list) and len(answers) > 0 else str(answers)     # get the first answer as string
+        
         results.append({
-            "title": sample["title"],
-            "evidence": retrieved,
-            "answer": answers  # 已經是 list 了
+            "title" : sample["title"],
+            "answer" : answers_str,
+            "evidence": retrieved_chunks
         })
-
+        
         del index
         torch.cuda.empty_cache()
-
-    # 存檔
-    with open("313552049.json", "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-    print("Successfully stored the answer to output.json")
-
+    
+    # Save the results to a JSON file
+    with open('output.json', 'w', encoding='utf-8') as f:
+        json.dump(results, f, ensure_ascii=False, indent=4)
+    print("Results saved to output.json")
+    
 if __name__ == "__main__":
     main()
+
