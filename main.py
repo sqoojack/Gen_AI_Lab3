@@ -1,4 +1,5 @@
 
+# Command line: python3 main.py
 # not use langchain
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, logging, BitsAndBytesConfig
@@ -7,8 +8,6 @@ import faiss
 import numpy as np
 import re
 from tqdm import tqdm
-from langchain.docstore.document import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 
 """ Set Hyperparameter """
@@ -23,10 +22,10 @@ class HyperParameters:
         self.temperature = temperature
 
 config = HyperParameters(
-    chunk_size=256,
-    chunk_overlap=128,
+    chunk_size=800,
+    chunk_overlap=200,
     max_length=256,     # maximum number of tokens to create
-    dist_threshold=0.6,
+    dist_threshold=0.4,
     top_k=13,
     top_p=0.9,
     temperature=0.7
@@ -55,6 +54,7 @@ def split_by_chapter(text):
             chapters.append(header + "\n" + content)
     return chapters
 
+""" 在chapter內依句點, 問號來切句子, 組成長度不超過chunk_size的chunk"""
 def split_in_chapter(chapter_text, chunk_size):
     if len(chapter_text) <= chunk_size:
         return [chapter_text]
@@ -118,8 +118,8 @@ def generate_answer(device, prompts, tokenizer, model, max_new_tokens):
         outputs = model.generate(
             **input_ids,    # inputs contains input_ids and attention_mask, used as input for the model
             max_new_tokens=max_new_tokens,
-            do_sample=False,
-            num_beams=1,
+            do_sample=False, num_beams=1,
+            temperature=None, top_p=None,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
         )
@@ -145,17 +145,15 @@ def generate_answer(device, prompts, tokenizer, model, max_new_tokens):
 
 
 def main():
-    device = torch.device("cuda:1")
+    device = torch.device("cuda:0")
     logging.set_verbosity_error()  # Suppress warnings from transformers
     
     # with open('test.json', 'r', encoding='utf-8') as f:
-    with open('public_dataset.json', 'r', encoding='utf-8') as f:
-    # with open('private_dataset.json', 'r', encoding='utf-8') as f:
+    with open('dataset/public_dataset.json', 'r', encoding='utf-8') as f:
         data = json.load(f)
         
     embed_model = SentenceTransformer('intfloat/multilingual-e5-large', device=device)
     model_name = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-    # model_name = "mistralai/Mistral-7B-Instruct-v0.3"
     
     bnb_config = BitsAndBytesConfig(
         load_in_8bit=True,
@@ -173,14 +171,14 @@ def main():
         text = sample.get("full_text", "")
         chunks = split_text(text, config.chunk_size, config.chunk_overlap)
             
-        embeddings = embed_model.encode(chunks, convert_to_tensor=False)
+        embeddings = embed_model.encode(chunks, convert_to_tensor=False, normalize_embeddings=True)
         embeddings = np.array(embeddings, dtype=np.float32)
-        index = faiss.IndexFlatL2(embeddings.shape[1])
+        index = faiss.IndexFlatIP(embeddings.shape[1])
         index.add(embeddings)
         
-        question_embedding = embed_model.encode([sample["question"]], convert_to_tensor=False)
-        dist, idx = index.search(np.array(question_embedding, dtype=np.float32), config.top_k)
-        retrieved_chunks = [chunks[i] for d, i in zip(dist[0], idx[0]) if d <= config.dist_threshold]   # get the top k chunks
+        question_embedding = embed_model.encode([sample["question"]], convert_to_tensor=False, normalize_embeddings=True)
+        sim_scores, idx = index.search(np.array(question_embedding, dtype=np.float32), config.top_k)
+        retrieved_chunks = [chunks[i] for score, i in zip(sim_scores[0], idx[0]) if score >= config.dist_threshold]   # get the top k chunks
         
         prompt = build_prompts(sample["question"], retrieved_chunks)
         answers = generate_answer(device, [prompt], tokenizer, model, config.max_length)[0]
@@ -196,7 +194,7 @@ def main():
         torch.cuda.empty_cache()
     
     # Save the results to a JSON file
-    with open('output.json', 'w', encoding='utf-8') as f:
+    with open('output/output.json', 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
     print("Results saved to output.json")
     
