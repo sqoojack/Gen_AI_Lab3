@@ -62,12 +62,12 @@ def split_in_chapter(chapter_text, chunk_size):
     chunks, current = [], ""   # chunks: is a list used to store the split chunks, current: is a string used to store the current chunk
     
     # Iterate through each sentence and check if adding it to the current chunk exceeds the chunk size
-    for s in sentence:  
-        if len(current) + len(s) <= chunk_size:
-            current += s + " "
+    for new_s in sentence:  
+        if len(current) + len(new_s) <= chunk_size:
+            current += new_s + " "
         else:
             chunks.append(current.strip())
-            current = s + " "
+            current = new_s + " "
     if current:
         chunks.append(current.strip())
     return chunks
@@ -148,14 +148,13 @@ def main():
     device = torch.device("cuda:0")
     logging.set_verbosity_error()  # Suppress warnings from transformers
     
-    # with open('test.json', 'r', encoding='utf-8') as f:
     with open('dataset/public_dataset.json', 'r', encoding='utf-8') as f:
         data = json.load(f)
         
     embed_model = SentenceTransformer('intfloat/multilingual-e5-large', device=device)
     model_name = "meta-llama/Llama-3.2-11B-Vision-Instruct"
     
-    bnb_config = BitsAndBytesConfig(
+    bnb_config = BitsAndBytesConfig(    # quantized 4bit for model
         load_in_8bit=True,
         llm_int8_threshold=6.0,           # can be fine-tuned depending on the memory usage
         llm_int8_has_fp16_weight=False   # set to True for higher performance

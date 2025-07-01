@@ -2,7 +2,6 @@
 
 import json
 import argparse
-# from typing import List     # import list type
 from tqdm import tqdm
 import gc   # garbage collection -> to save the memory
 import torch
@@ -16,8 +15,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter, TokenTextSpl
 from langchain.chains import RetrievalQA
 
 """ Load json file and convert each entry into a Document.
-    For each item in the json array, extract the "full_text" and "title" field as content and metadata.
-    Return a list of Document objects. """
+    For each item in the json array, extract the "full_text" and "title" field as content and metadata. Return a list of Document objects. """
 def load_json_dataset(path):
     with open(path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -25,10 +23,10 @@ def load_json_dataset(path):
     return [Document(page_content=sample.get("full_text", ""),
                     metadata={"title": sample.get("title", "")})    # metadata is type of dict
             for sample in data]
-    
+
+""" split the text to the chunk, then turn into the FAISS vector"""
 def build_FAISS(docs, embeddings):
     splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)     # overlap is used to ensure connectivity of context
-    # splitter = TokenTextSplitter(chunk_size=100, chunk_overlap=15)     # according to number of token, instead of character
     split_docs = splitter.split_documents(docs)     
     vectorstore = FAISS.from_documents(documents=split_docs, embedding=embeddings)    # build FAISS vector
     return vectorstore      # used to vector similarity search
@@ -58,15 +56,13 @@ def main():
     """ Tokenizer: text -> token -> ID -> add special token -> attention_mask(區分真實token和填充token) -> decode to context """
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)  # load tokenizer
     tokenizer.pad_token_id = tokenizer.eos_token_id
-    
-    
-    
+
     """ Create generation pipeline from Transformer """
     text_generation = pipeline(task="text-generation", model=model, tokenizer=tokenizer, max_new_tokens=256,
                             do_sample=False, num_beams=1, top_p=None, temperature=None, use_cache=True, return_full_text=False,   # remember to set return_full_text=False, or it will return full_prompt
                             eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id)
     
-    llm = HuggingFacePipeline(pipeline=text_generation)
+    llm = HuggingFacePipeline(pipeline=text_generation)   # becomes an LLM object which compatible with langchain
     
     """ k: number of passages fed to the LLM eventually
         fetch_k: number of candidates retrieved before picking k
@@ -93,9 +89,9 @@ def main():
         input_variables=["context", "question"]
     )
     
+    # LangChain’s RetrievalQA will automatically fill the retrieved results into {context} in prompt
     qa_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever, verbose=False,
-        return_source_documents=True, chain_type_kwargs={"prompt": prompt}
-    )
+        return_source_documents=True, chain_type_kwargs={"prompt": prompt})
     
     with open(args.data_path, 'r', encoding="utf-8") as f:
         samples = json.load(f)
